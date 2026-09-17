@@ -37,10 +37,16 @@ from huggingface_hub import hf_hub_download
 from llama_cpp import Llama
 import gradio as gr
 
+import tools
+
 REPO = os.environ.get("MODEL_REPO", "cyjin-yl/Qwen3.8-27B-Uncensored-Cyber-agentic-imatrix-GGUF")
 FILE = os.environ.get("MODEL_FILE", "Qwen3.8-27B-Uncensored-Cyber-IQ4_XS-imatrix-fromq8.gguf")
 N_CTX = int(os.environ.get("N_CTX", "8192"))
 PORT = int(os.environ.get("PORT", "7860"))
+TOOL_ROUNDS = int(os.environ.get("TOOL_ROUNDS", "3"))
+# Passwordless space -> shell stays off (an open URL must not hand out a shell). search + fetch
+# give the model live internet; the container already has egress.
+SHELL_OK = False
 
 print(f"downloading {REPO}/{FILE} ...", flush=True)
 model_path = hf_hub_download(REPO, FILE, cache_dir="/cache/hf")
@@ -49,24 +55,54 @@ llm = Llama(model_path=model_path, n_gpu_layers=-1, n_ctx=N_CTX, n_batch=512, ve
 print("model ready", flush=True)
 
 
-def chat(message, history, temperature, max_tokens):
-    # History back to the model must be the clean answers only, or its own leaked reasoning feeds
-    # back in and compounds. Gradio already holds the stripped text we yielded, so pass it through.
-    msgs = list(history or []) + [{"role": "user", "content": message}]
-    out = ""
+def _answer(text):
+    """Drop the model's <think> preamble; return the answer body."""
+    return text.split("</think>", 1)[1] if "</think>" in text else text
+
+
+def _gen(msgs, temperature, max_tokens):
+    """Stream one turn. `stop` cuts generation right after a tool call so we can act on it."""
     for ch in llm.create_chat_completion(
-        messages=msgs, stream=True,
+        messages=msgs, stream=True, stop=["</tool>"],
         temperature=float(temperature), max_tokens=int(max_tokens), top_p=0.9,
     ):
-        delta = ch["choices"][0]["delta"].get("content", "")
-        if not delta:
-            continue
-        out += delta
-        # This model emits a reasoning preamble ending in </think>; show only the answer after it.
-        if "</think>" in out:
-            yield out.split("</think>", 1)[1].lstrip("\n")
-        else:
-            yield "_thinking…_"
+        yield ch["choices"][0]["delta"].get("content", "") or ""
+
+
+def chat(message, history, temperature, max_tokens):
+    # History back to the model is the clean answers only (Gradio holds what we yielded), or the
+    # model's own leaked reasoning/tool syntax feeds back in and compounds.
+    msgs = ([{"role": "system", "content": tools.system_prompt(SHELL_OK)}]
+            + list(history or []) + [{"role": "user", "content": message}])
+    shown = ""
+    for _ in range(TOOL_ROUNDS):
+        out = ""
+        for delta in _gen(msgs, temperature, max_tokens):
+            if not delta:
+                continue
+            out += delta
+            body = _answer(out)
+            yield shown + (body.lstrip("\n") if "</think>" in out else "_thinking…_")
+
+        answer = _answer(out).strip()
+        call = tools.parse_tool_call(answer)
+        if not call:
+            return                                   # ordinary reply, already streamed
+        name, arg = call
+
+        prose = answer.split("<tool>")[0].strip()
+        shown += (prose + "\n\n") if prose else ""
+        shown += f"> 🔧 **{name}** · `{arg.splitlines()[0][:120]}`\n"
+        yield shown + "\n_running…_"
+
+        result = tools.run(name, arg, shell_ok=SHELL_OK)
+        shown += "\n```\n" + result + "\n```\n\n"
+        yield shown
+
+        msgs.append({"role": "assistant", "content": answer})
+        msgs.append({"role": "user", "content": f"<tool_result>\n{result}\n</tool_result>"})
+
+    yield shown + f"\n_(stopped after {TOOL_ROUNDS} tool calls)_"
 
 
 gr.ChatInterface(
