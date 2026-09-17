@@ -12,6 +12,27 @@ import os
 os.environ.setdefault("FORWARDED_ALLOW_IPS", "*")   # gateway X-Forwarded-Proto -> no blank page over https
 os.environ.setdefault("HF_HOME", "/cache/hf")
 
+# The CUDA llama.cpp wheel links libcudart.so.12 / libcublas*, which the slim base image lacks.
+# We install them from pip (nvidia-*-cu12) but the dynamic loader won't find them at dlopen time,
+# so preload each with RTLD_GLOBAL (in dependency order) to satisfy libllama.so's NEEDED entries.
+import ctypes
+import glob
+import site
+import sys
+
+_libdirs = []
+for _base in set(site.getsitepackages() + [sys.prefix + "/lib"]):
+    _libdirs += glob.glob(_base + "/nvidia/*/lib")
+for _soname in ("libcudart.so.12", "libcublasLt.so.12", "libcublas.so.12"):
+    for _d in _libdirs:
+        _p = os.path.join(_d, _soname)
+        if os.path.exists(_p):
+            try:
+                ctypes.CDLL(_p, mode=ctypes.RTLD_GLOBAL)
+                break
+            except OSError:
+                pass
+
 from huggingface_hub import hf_hub_download
 from llama_cpp import Llama
 import gradio as gr
