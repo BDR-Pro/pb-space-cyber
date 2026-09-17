@@ -50,6 +50,8 @@ print("model ready", flush=True)
 
 
 def chat(message, history, temperature, max_tokens):
+    # History back to the model must be the clean answers only, or its own leaked reasoning feeds
+    # back in and compounds. Gradio already holds the stripped text we yielded, so pass it through.
     msgs = list(history or []) + [{"role": "user", "content": message}]
     out = ""
     for ch in llm.create_chat_completion(
@@ -57,9 +59,14 @@ def chat(message, history, temperature, max_tokens):
         temperature=float(temperature), max_tokens=int(max_tokens), top_p=0.9,
     ):
         delta = ch["choices"][0]["delta"].get("content", "")
-        if delta:
-            out += delta
-            yield out
+        if not delta:
+            continue
+        out += delta
+        # This model emits a reasoning preamble ending in </think>; show only the answer after it.
+        if "</think>" in out:
+            yield out.split("</think>", 1)[1].lstrip("\n")
+        else:
+            yield "_thinking…_"
 
 
 gr.ChatInterface(
